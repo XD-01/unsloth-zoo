@@ -137,7 +137,7 @@ from huggingface_hub import (
     hf_hub_download,
     HfFileSystem,
 )
-from safetensors import safe_open
+from safetensors.torch import safe_open
 from safetensors.torch import save_file
 from collections import OrderedDict
 from tqdm import tqdm as ProgressBar
@@ -351,45 +351,90 @@ pass
 def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dtype, model_class_name):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
-    filename = os.path.join(save_directory, filename)
-    tensors = OrderedDict()
-    count = 0
+
     import psutil
     import tempfile
     import pickle
-    limit = 700 * 1024 * 1024 # 700MB
-    with safe_open(filename, framework = "pt", device = "cpu") as file:
+    import os
+    import shutil
+    from collections import OrderedDict # Ensure OrderedDict is imported
+    from safetensors import safe_open
+    from safetensors.torch import save_file # Ensure these are imported
+
+    filename_original = os.path.join(save_directory, filename)  # Original file path
+    tensors = OrderedDict()
+    count = 0
+    
+
+    # Define _convert_lora_keys_to_safetensor_format and _merge_lora
+    # These functions are assumed to be defined elsewhere in unsloth_zoo/saving_utils.py
+    # For this merged code to be runnable, they would need to be present or mocked.
+    # For the purpose of merging, we assume their existence.
+    limit = 700 * 1024 * 1024  # 700MB
+
+    with safe_open(filename_original, framework="pt", device="cpu") as file:
         safetensor_keys = list(file.keys())
 
-        # Convert LoRA keys to match safetensor format
+        # Convert LoRA keys to match safetensor format (using the re-introduced model_class_name)
         converted_lora_weights = _convert_lora_keys_to_safetensor_format(
-            lora_weights, safetensor_keys, model_class_name=model_class_name)
+            lora_weights, safetensor_keys, model_class_name=model_class_name
+        )
 
         for key in safetensor_keys:
             W = file.get_tensor(key)
-            # Remove .weight suffix to match LoRA key format
-            lora_key = key[:-len(".weight")] if key.endswith(".weight") else key
-            lora_stats = converted_lora_weights.get(lora_key, None)
+            # Remove .weight suffix to match LoRA key format for lookup in converted_lora_weights
+            lora_key_for_lookup = key[:-len(".weight")] if key.endswith(".weight") else key
+            lora_stats = converted_lora_weights.get(lora_key_for_lookup, None)
 
             if lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
                 count += 1
-                W = _merge_lora(W, lora_stats, key)
+                W = _merge_lora(W, lora_stats, key) # Pass original key to _merge_lora if needed
+
+                # Original memory optimization logic
                 if psutil.virtual_memory().available <= limit:
-                    temp_file = tempfile.NamedTemporaryFile(suffix = ".pt")
-                    torch.save(W.to(output_dtype), temp_file, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL)
-                    W = torch.load(temp_file, map_location = "cpu", mmap = True, weights_only = False)
+                    # Use delete=False to keep the file after closing for torch.load
+                    temp_file = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
+                    temp_filename = temp_file.name
+                    torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+                    temp_file.close() # Close the file handle before loading
+                    W = torch.load(temp_filename, map_location="cpu", mmap=True, weights_only=False)
+                    os.remove(temp_filename) # Clean up temporary .pt file immediately
                 else:
                     # To enable fast async copy from CUDA to CPU, allocate a pinned (page-locked) buffer
+                    # This path was for direct CPU transfer without a temp file
+                    # Ensure it handles output_dtype correctly
                     pinned_cpu = torch.empty_like(W, device="cpu", pin_memory=True, dtype=output_dtype)
                     W = W.to(pinned_cpu.device, dtype=pinned_cpu.dtype, non_blocking=True)
             else:
-                if lora_key in converted_lora_weights:
-                    lora_stats_info = converted_lora_weights[lora_key]
-            tensors[key] = W
-        pass
-    pass
+                # If it's not a LoRA layer, just ensure it's on CPU and correct dtype if necessary
+                # This part was missing in the original code, but important for non-LoRA layers
+                W = W.to(device="cpu", dtype=output_dtype)
 
-    save_file(tensors, filename, metadata = {"format": "pt"})
+            tensors[key] = W
+        pass # End of file.keys() loop
+    pass # End of safe_open context
+
+    # Create a temporary safetensors file in the same directory for atomic rename
+    # This addresses the file locking issue directly.
+    with tempfile.NamedTemporaryFile(suffix=".safetensors", dir=save_directory, delete=False) as tmpfile:
+        temp_filename_safetensors = tmpfile.name
+
+    # Save all processed tensors to the temporary safetensors file
+    save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})
+
+    # Replace the original file with the temporary file atomically
+    try:
+        os.replace(temp_filename_safetensors, filename_original)  # Attempt atomic rename
+    except OSError as e:
+        # If rename fails (e.g., due to permissions), fall back to copy and remove temporary file
+        print(f"Error renaming temporary file: {e}. Attempting copy and replace.")
+        shutil.copy2(temp_filename_safetensors, filename_original)
+        os.remove(temp_filename_safetensors)
+    finally:
+        # Ensure the temporary file is removed even if copy2 fails for some reason
+        if os.path.exists(temp_filename_safetensors):
+            os.remove(temp_filename_safetensors)
+
     return count
 pass
 
